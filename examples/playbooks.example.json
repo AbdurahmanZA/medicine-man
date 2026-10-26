@@ -1,0 +1,24 @@
+{
+  "101": {
+    "_app": "Wiki in CT 101 on pve1: Node app wiki.service on :3000, nginx :80 in front, SQLite at /var/lib/wiki/wiki.db. LAN only.",
+    "_host": "pve1",
+    "web": {
+      "means": "GET / on :80 does not answer",
+      "look": ["systemctl status nginx wiki", "journalctl -u wiki -n 80 --no-pager", "nginx -t", "df -h /"],
+      "fix": ["pct exec 101 -- systemctl restart wiki", "pct exec 101 -- systemctl restart nginx"],
+      "note": "If the app crash-loops on a code, config or migration error, a restart won't help: no fix, quote the error. If nginx -t fails, no fix (config edits are a human job)."
+    },
+    "disk": {
+      "means": "root filesystem over 90%",
+      "look": ["df -h /", "du -xh --max-depth=2 /var | sort -h | tail -n 15", "journalctl --disk-usage"],
+      "fix": ["pct exec 101 -- journalctl --vacuum-size=200M", "pct exec 101 -- apt-get clean"],
+      "note": "Never delete application data. If the journal and apt cache are not the cause, report the biggest directories."
+    },
+    "guest": {
+      "means": "CT 101 is not running",
+      "look": ["pct status 101", "pct config 101"],
+      "fix": [],
+      "note": "NEVER start it: someone may have shut it down. Report only."
+    }
+  }
+}

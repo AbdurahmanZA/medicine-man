@@ -1,0 +1,4 @@
+# On EACH Proxmox host, in /root/.ssh/authorized_keys (or /etc/pve/priv/authorized_keys on a cluster).
+# `restrict` disables port forwarding, agent forwarding, X11 and PTYs; the gate decides what runs.
+command="/usr/local/bin/healer-gate ro",restrict ssh-ed25519 AAAA...replace-with-healer_ro.pub healer-ro
+command="/usr/local/bin/healer-gate rw",restrict ssh-ed25519 AAAA...replace-with-healer_rw.pub healer-rw

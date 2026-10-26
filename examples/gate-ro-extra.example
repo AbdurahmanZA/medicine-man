@@ -1,0 +1,3 @@
+# /etc/healer/gate-ro-extra on each Proxmox host - extra commands the AI may run read-only.
+# Only list scripts that never write (their arguments are not checked).
+# my-appcheck

@@ -1,0 +1,16 @@
+[Unit]
+Description=Medicine Man (self-heal agent, Claude Code headless)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/healer/healer.env
+EnvironmentFile=-/etc/healer/claude.env
+ExecStart=/usr/bin/python3 /opt/healer/healer/healer.py
+WorkingDirectory=/opt/healer/healer
+Restart=always
+RestartSec=5
+MemoryMax=800M
+
+[Install]
+WantedBy=multi-user.target

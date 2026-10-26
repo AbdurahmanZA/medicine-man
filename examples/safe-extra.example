@@ -1,0 +1,3 @@
+# /etc/healer/safe-extra - extra auto-run patterns (Python regex, must match the WHOLE command).
+# Keep these to idempotent restarts of things that already exist.
+# systemctl restart my-dnat\.service

@@ -1,0 +1,4 @@
+# /etc/healer/hosts - Proxmox hosts the healer may reach (read by px and healer.py)
+# name      address (LAN or Tailscale IP)
+pve1        192.0.2.10
+pve2        192.0.2.11

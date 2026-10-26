@@ -1,0 +1,2 @@
+# /etc/healer/gate-deny-read on each Proxmox host - extra regexes for paths the AI must never read.
+# /srv/vault

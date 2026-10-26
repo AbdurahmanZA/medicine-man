@@ -1,0 +1,22 @@
+#!/bin/bash
+# px <host> '<command>' - the ONLY way the AI touches your hosts.
+# Uses the read-only key; healer-gate on the Proxmox host re-checks every command.
+# Hosts come from $HEALER_HOSTS_FILE (default /etc/healer/hosts): one "name address" per line.
+set -u
+HOSTS_FILE="${HEALER_HOSTS_FILE:-/etc/healer/hosts}"
+KEY="${HEALER_RO_KEY:-$HOME/.ssh/healer_ro}"
+
+declare -A H=()
+if [ -r "$HOSTS_FILE" ]; then
+  while read -r name addr _; do
+    [[ -z "${name:-}" || "$name" == \#* ]] && continue
+    if [[ "$name" == *=* ]]; then addr="${name#*=}"; name="${name%%=*}"; fi
+    [ -n "${addr:-}" ] && H[$name]=$addr
+  done < "$HOSTS_FILE"
+fi
+
+ip=${H[${1:-}]:-}
+[ -z "$ip" ] && { echo "usage: px <${!H[*]}> '<command>'   (hosts from $HOSTS_FILE)" >&2; exit 2; }
+shift
+exec ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
+  -i "$KEY" "root@$ip" "$*"

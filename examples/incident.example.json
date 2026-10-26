@@ -1,0 +1,11 @@
+{
+  "key": "192.0.2.21#wiki|http",
+  "label": "Wiki (CT 101)",
+  "ip": "192.0.2.21",
+  "detail": "GET http://192.0.2.21/ -> connection refused (3 checks in a row)",
+  "host": "pve1",
+  "ctid": "101",
+  "check": "web",
+  "probe": {"http": "http://192.0.2.21/", "expect": [200, 302]},
+  "context": {"stack": "nginx -> node app :3000 (systemd wiki.service)", "exposure": "LAN only"}
+}
