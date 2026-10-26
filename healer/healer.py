@@ -43,6 +43,7 @@ SAFE_EXTRA  = env("HEALER_SAFE_EXTRA", "/etc/healer/safe-extra")
 REPROBE_URL = env("HEALER_REPROBE_URL", "")    # optional: GET ?key=&ip=&label= -> {"ok": bool, "detail": str}
 RW_KEY      = env("HEALER_RW_KEY", "/root/.ssh/healer_rw")
 AI_USER     = env("HEALER_AI_USER", "healer-ai")
+CLAUDE_BIN  = env("HEALER_CLAUDE_BIN", "claude")   # full path if `claude` isn't on the AI user's PATH
 COOLDOWN_S  = int(env("HEALER_COOLDOWN_S", "3600"))
 MAX_TURNS   = env("HEALER_MAX_TURNS", "20")
 SETTLE_S    = int(env("HEALER_SETTLE_S", "45"))  # wait after a fix before re-probing
@@ -78,7 +79,8 @@ HOSTS = load_hosts()
 
 # A fix command auto-runs only if it FULLY matches one of these. Everything else -> approval.
 SAFE = [
-    r"pct exec \d+ -- systemctl (restart|reload|reset-failed) [\w@.\-]+(\.service)?",
+    # Unit names without dots, or ending in .service: never a .target (kexec.target stops the guest).
+    r"pct exec \d+ -- systemctl (restart|reload|reset-failed) [\w@\-]+(\.service)?",
     r"pct exec \d+ -- pm2 (restart|reload) [\w.\-]+",
     r"pct exec \d+ -- docker restart [\w.\-]+",
     r"pct exec \d+ -- journalctl --vacuum-(size|time)=\w+",
@@ -93,7 +95,7 @@ except OSError:
     pass
 NEVER = (r"\b(pct|qm)\s+(start|stop|shutdown|reboot|resume|destroy|set|create|restore|rollback)\b|\bonboot\b|\breboot\b"
          r"|\bpoweroff\b|\btailscale\s+(serve|funnel|set)\b|\bcloudflared\b.*\btunnel\b|\bufw\s+allow\b|\biptables\s+-[AI]\b"
-         r"|/etc/(nginx|cloudflared)|[;&|`\n]|\$\(")
+         r"|/etc/(nginx|cloudflared)|[;&|`\n]|\$\(|\.target\b|\b(pve-container|qemu-server)@|\blxc-|\b(kill|killall|pkill|kexec)\b")
 
 LOCK = threading.Lock()
 COLS = ["id", "ts", "key", "label", "ip", "detail", "host", "ctid", "check_name", "probe", "context",
@@ -141,6 +143,11 @@ def notify(subject, text):
             urllib.request.urlopen(req, timeout=10).read()
         except Exception as e:
             print("webhook failed: %s" % e, flush=True)
+
+
+def same(a, b):
+    """Constant-time compare that also copes with non-ASCII input (compare_digest on str raises)."""
+    return secrets.compare_digest(str(a).encode("utf-8"), str(b).encode("utf-8"))
 
 
 def is_safe(cmd):
@@ -209,14 +216,19 @@ def run_claude(inc, model=None):
                                          look="; ".join(book.get("look", [])), host=host,
                                          fix=json.dumps(book.get("fix")) if book.get("fix") else "NONE (report only)",
                                          note=book.get("note") or "-")
-    run_env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/home/" + AI_USER, "DISABLE_AUTOUPDATER": "1"}
+    home = "/home/" + AI_USER
+    # ~/.local/bin is where Claude Code's native installer puts `claude`.
+    run_env = {"PATH": f"{home}/.local/bin:/usr/local/bin:/usr/bin:/bin", "HOME": home, "DISABLE_AUTOUPDATER": "1"}
     for k in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"):   # else: the AI user's own `claude` login
         if env(k):
             run_env[k] = env(k)
-    cmd = [shutil.which("runuser") or "/usr/sbin/runuser", "-u", AI_USER, "--", "claude", "-p", prompt,
+    # px is the ONLY tool. Claude Code's built-in Read/Grep/Glob would otherwise let the model read
+    # files on this machine, including its own read-only SSH key.
+    cmd = [shutil.which("runuser") or "/usr/sbin/runuser", "-u", AI_USER, "--", CLAUDE_BIN, "-p", prompt,
            "--output-format", "json", "--model", model or MODEL, "--max-turns", MAX_TURNS,
            "--allowedTools", "Bash(px:*)",
-           "--disallowedTools", "Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch"]
+           "--disallowedTools", "Read", "Glob", "Grep", "LS", "Task", "Agent", "Write", "Edit", "MultiEdit",
+           "NotebookEdit", "NotebookRead", "WebFetch", "WebSearch", "TodoWrite"]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=900, env=run_env, cwd="/home/" + AI_USER)
     out = r.stdout.strip()
     try:
@@ -228,9 +240,21 @@ def run_claude(inc, model=None):
         plan = json.loads(m.group(1)) if m else None
     except ValueError:
         plan = None
-    plan = plan or {"diagnosis": text[-3000:], "confidence": "low", "fix": []}
+    plan = clean_plan(plan if isinstance(plan, dict) else {"diagnosis": text[-3000:], "confidence": "low", "fix": []})
     plan["model"] = model or MODEL
     return plan
+
+
+def clean_plan(p):
+    """Force the model's JSON into the shape the rest of the code expects (it is untrusted output)."""
+    s = lambda v, n: v[:n] if isinstance(v, str) else ("" if v is None else str(v)[:n])
+    fixes = []
+    for f in p.get("fix") if isinstance(p.get("fix"), list) else []:
+        if isinstance(f, dict) and isinstance(f.get("cmd"), str) and isinstance(f.get("host"), str) and f["cmd"].strip():
+            fixes.append({"host": f["host"][:64], "cmd": f["cmd"].strip()[:500], "why": s(f.get("why"), 500)})
+    conf = p.get("confidence") if p.get("confidence") in ("low", "medium", "high") else "low"
+    return {"diagnosis": s(p.get("diagnosis"), 6000), "root_cause": s(p.get("root_cause"), 500), "confidence": conf,
+            "guest_stopped": bool(p.get("guest_stopped")), "fix": fixes, "operator_note": s(p.get("operator_note"), 1000)}
 
 
 def apply_plan(plan):
@@ -251,6 +275,8 @@ def reprobe(inc):
     p = inc.get("probe") or {}
     try:
         if p.get("http"):
+            if not re.match(r"https?://", str(p["http"])):      # no file://, ftp:// and friends
+                return False, "probe must be an http(s) URL"
             req = urllib.request.Request(p["http"], headers={"User-Agent": "healer-reprobe"})
             try:
                 code = urllib.request.urlopen(req, timeout=15).status
@@ -278,13 +304,31 @@ def outcome(ok):
 
 
 def fmt_plan(plan):
-    fixes = "\n".join("  %s  $ %s\n      why: %s" % ("AUTO " if is_safe(f.get("cmd", "")) else "NEEDS-OK",
-                      f.get("cmd"), f.get("why", "")) for f in plan.get("fix", [])) or "  (no fix proposed)"
+    fixes = "\n".join("  %s  [%s] $ %s\n      why: %s" % ("AUTO " if is_safe(f.get("cmd", "")) else "NEEDS-OK",
+                      f.get("host", "?"), f.get("cmd"), f.get("why", "")) for f in plan.get("fix", [])) or "  (no fix proposed)"
     return ("Model: %s · Root cause: %s\nConfidence: %s\n\nDiagnosis:\n%s\n\nProposed fix:\n%s\n\nOperator note: %s"
             % (plan.get("model", "?"), plan.get("root_cause", "?"), plan.get("confidence", "?"),
                plan.get("diagnosis", "")[:2500], fixes, plan.get("operator_note", "")))
 
 
+def guarded(fn):
+    """Run an incident worker; if it dies, say so on the incident instead of leaving it stuck."""
+    def run(inc_id):
+        try:
+            fn(inc_id)
+        except Exception as e:
+            print("incident %s failed: %r" % (inc_id, e), flush=True)
+            try:
+                c = db()
+                c.execute("UPDATE incidents SET status='error', result=?, updated=? WHERE id=?",
+                          ("Healer error: %s" % str(e)[:500], int(time.time()), inc_id))
+                c.commit(); c.close()
+            except Exception:
+                pass
+    return run
+
+
+@guarded
 def handle(inc_id):
     with LOCK:      # one investigation at a time - keeps RAM and blast radius small
         c = db()
@@ -329,6 +373,7 @@ def handle(inc_id):
         c.close()
 
 
+@guarded
 def approve(inc_id):
     with LOCK:
         c = db()
@@ -346,6 +391,9 @@ def approve(inc_id):
 
 def new_incident(d):
     key = str(d.get("key") or "")[:300]
+    ctx = json.dumps(d.get("context")) if d.get("context") else None
+    if ctx and len(ctx) > 8000:
+        raise ValueError("context is larger than 8000 characters")
     c = db()
     if c.execute("SELECT id FROM incidents WHERE key=? AND ts>?", (key, int(time.time()) - COOLDOWN_S)).fetchone():
         c.close(); return None
@@ -355,7 +403,7 @@ def new_incident(d):
                     (now, key, str(d.get("label") or key)[:200], str(d.get("ip") or "")[:100], str(d.get("detail") or "")[:4000],
                      str(d.get("host") or ""), str(d.get("ctid") or ""), str(d.get("check") or ""),
                      json.dumps(d.get("probe")) if isinstance(d.get("probe"), dict) else None,
-                     json.dumps(d.get("context"))[:8000] if d.get("context") else None,
+                     ctx,
                      "queued", secrets.token_urlsafe(16), now))
     c.commit(); i = cur.lastrowid; c.close()
     threading.Thread(target=handle, args=(i,), daemon=True).start()
@@ -418,7 +466,7 @@ def confirm_html(inc, action, tok):
 
 
 INCIDENT_CHIP = {"healed": ("ok", "Healed"), "fix-failed": ("bad", "Fix failed"), "awaiting-approval": ("warn", "Needs your OK"),
-                 "applied": ("info", "Applied, not verified"), "diagnosed": ("info", "Diagnosed"), "rejected": ("idle", "Rejected"),
+                 "applied": ("info", "Applied, not verified"), "error": ("bad", "Healer error"), "diagnosed": ("info", "Diagnosed"), "rejected": ("idle", "Rejected"),
                  "queued": ("idle", "Queued"), "diagnosing": ("idle", "Diagnosing"), "applying": ("idle", "Applying")}
 
 
@@ -451,6 +499,7 @@ class H(BaseHTTPRequestHandler):
         b = (body if isinstance(body, str) else json.dumps(body)).encode()
         self.send_response(code); self.send_header("Content-Type", ctype)
         self.send_header("X-Frame-Options", "DENY"); self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")      # approve/view tokens never leak via Referer
         for k, v in headers:
             self.send_header(k, v)
         self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
@@ -463,7 +512,7 @@ class H(BaseHTTPRequestHandler):
         return dict(p.strip().split("=", 1) for p in (self.headers.get("Cookie") or "").split(";") if "=" in p)
 
     def _tok_ok(self):
-        return bool(TOKEN) and secrets.compare_digest(self.headers.get("X-Healer-Token", ""), TOKEN)
+        return bool(TOKEN) and same(self.headers.get("X-Healer-Token", ""), TOKEN)
 
     def _body(self, limit=65536):
         n = int(self.headers.get("Content-Length") or 0)
@@ -471,13 +520,14 @@ class H(BaseHTTPRequestHandler):
 
     def _client(self):
         if TRUST_PROXY and self.headers.get("X-Forwarded-For"):
-            return self.headers["X-Forwarded-For"].split(",")[0].strip()
+            # The LAST entry is the one your proxy appended; anything before it the client wrote itself.
+            return self.headers["X-Forwarded-For"].split(",")[-1].strip()
         return self.client_address[0]
 
     def _decision(self, m, tok):
         """(incident, error-response) for an approve/reject link."""
         c = db(); inc = get_incident(c, int(m.group(2))); c.close()
-        if not inc or not tok or not secrets.compare_digest(inc["token"], tok):
+        if not inc or not tok or not same(inc["token"], tok):
             return None, (403, "bad link")
         if inc["status"] != "awaiting-approval":
             return None, (409, "already %s" % inc["status"])
@@ -494,9 +544,10 @@ class H(BaseHTTPRequestHandler):
             if not VIEW_TOKEN:
                 return self._s(503, "Set HEALER_VIEW_TOKEN to enable the incident page.", "text/plain")
             v = (qs.get("v") or [""])[0]
-            if v and secrets.compare_digest(v, VIEW_TOKEN):
-                return self._s(200, page(), "text/html; charset=utf-8", (self._cookie(VIEW_TOKEN, 31536000),))
-            if secrets.compare_digest(self._jar().get("healer_v", ""), VIEW_TOKEN):
+            if v and same(v, VIEW_TOKEN):
+                # Set the cookie, then drop the key from the address bar (and from browser history).
+                return self._s(302, "", "text/plain", (("Location", "/incidents"), self._cookie(VIEW_TOKEN, 31536000)))
+            if same(self._jar().get("healer_v", ""), VIEW_TOKEN):
                 return self._s(200, page(), "text/html; charset=utf-8")
             if WEB_PASS:
                 return self._s(302, "", "text/plain", (("Location", "/login"),))
@@ -525,13 +576,17 @@ class H(BaseHTTPRequestHandler):
             inc, err = self._decision(m, (form.get("t") or [""])[0])
             if err:
                 return self._s(err[0], err[1], "text/plain")
+            # Claim the incident atomically: of two clicks (or two tabs) only one moves it out of
+            # awaiting-approval, so a plan can never run twice.
             c = db()
-            if m.group(1) == "reject":
-                c.execute("UPDATE incidents SET status='rejected', updated=? WHERE id=?", (int(time.time()), inc["id"]))
-                c.commit(); c.close()
-                return self._s(200, shell("Rejected", "<section class=panel>Nothing was run.</section>"), "text/html; charset=utf-8")
-            c.execute("UPDATE incidents SET status='applying', updated=? WHERE id=?", (int(time.time()), inc["id"]))
+            new = "rejected" if m.group(1) == "reject" else "applying"
+            won = c.execute("UPDATE incidents SET status=?, updated=? WHERE id=? AND status='awaiting-approval'",
+                            (new, int(time.time()), inc["id"])).rowcount == 1
             c.commit(); c.close()
+            if not won:
+                return self._s(409, "already handled", "text/plain")
+            if new == "rejected":
+                return self._s(200, shell("Rejected", "<section class=panel>Nothing was run.</section>"), "text/html; charset=utf-8")
             threading.Thread(target=approve, args=(inc["id"],), daemon=True).start()
             return self._s(200, shell("Approved", "<section class=panel>Running now. The result arrives the same way as "
                                       "this alert, and on the <a href='/incidents#%d'>incident page</a>.</section>" % inc["id"]),
@@ -547,7 +602,9 @@ class H(BaseHTTPRequestHandler):
                 return self._s(429, login_html("Too many attempts - wait a few minutes."), "text/html; charset=utf-8")
             form = urllib.parse.parse_qs(self._body(4096).decode("utf-8", "replace"))
             user = (form.get("user") or [""])[0]; pw = (form.get("pass") or [""])[0]
-            if not (secrets.compare_digest(user, WEB_USER) and secrets.compare_digest(pw, WEB_PASS)):
+            if not (same(user, WEB_USER) and same(pw, WEB_PASS)):
+                if len(LOGIN_FAILS) > 10000:
+                    LOGIN_FAILS.clear()                # bounded memory under a spray of addresses
                 LOGIN_FAILS[ip] = (cnt + 1, first)
                 time.sleep(0.5)
                 return self._s(401, login_html("Wrong user or password."), "text/html; charset=utf-8")
@@ -562,7 +619,10 @@ class H(BaseHTTPRequestHandler):
                 return self._s(400, {"error": "json"})
             if not d.get("key"):
                 return self._s(400, {"error": "key required"})
-            i = new_incident(d)
+            try:
+                i = new_incident(d)
+            except ValueError as e:
+                return self._s(400, {"error": str(e)})
             return self._s(200, {"incident": i, "deduped": i is None})
         if u.path == "/diagnose":
             g = lambda k: (qs.get(k) or [""])[0]

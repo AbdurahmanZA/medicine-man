@@ -1,0 +1,4 @@
+# /etc/healer/gate-ro-exact on each Proxmox host - exact command strings your own monitoring sends,
+# trusted verbatim in read-only mode (one per line, must match character for character).
+# Use it for fixed sweeps that need globs or awk programs. Never put AI-written commands here.
+# grep -H -E '^(hostname|tags):' /etc/pve/lxc/*.conf

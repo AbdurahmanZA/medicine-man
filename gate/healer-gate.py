@@ -23,7 +23,7 @@ Optional local extensions (one entry per line, # comments allowed):
   /etc/healer/gate-ro-extra     extra read-only commands, e.g. your own check scripts
   /etc/healer/gate-deny-read    extra regexes for paths the AI must never read
 """
-import os, re, shlex, sys, time
+import os, posixpath, re, shlex, sys, time
 
 LOG = os.environ.get("HEALER_GATE_LOG", "/var/log/healer-gate.log")
 CONF = os.environ.get("HEALER_GATE_CONF_DIR", "/etc/healer")
@@ -31,11 +31,18 @@ MODE = sys.argv[1] if len(sys.argv) > 1 else "ro"
 CMD = os.environ.get("SSH_ORIGINAL_COMMAND", "").strip()
 
 DENY = [
-    r"\b(pct|qm)\s+(start|stop|shutdown|reboot|resume|suspend|create|destroy|restore|rollback|set|"
+    r"\b(pct|qm)(\s+-\S+)*\s+(start|stop|shutdown|reboot|resume|suspend|create|destroy|restore|rollback|set|"
     r"migrate|clone|template|unlock|move[-_]volume|move[-_]disk|resize|snapshot|delsnapshot|mount|unmount)\b",
     r"\bonboot\b", r"\bvzdump\b.*--remove", r"\bpvesm\s+(remove|free|set|add)\b",
     r"\b(reboot|poweroff|halt)\b", r"\bshutdown\b", r"\binit\s+[06]\b",
-    r"\bsystemctl\s+(reboot|poweroff|halt|kexec|isolate|mask)\b",
+    # systemctl power verbs even behind flags (systemctl --no-block reboot), and any target change:
+    # restarting kexec.target / exit.target / halt.target stops a guest just like a reboot does.
+    r"\bsystemctl\b(\s+-\S+)*\s+(reboot|poweroff|halt|kexec|isolate|mask|exit|emergency|rescue|default|"
+    r"suspend|hibernate|hybrid-sleep|suspend-then-hibernate|soft-reboot|kill|set-default)\b",
+    r"\bsystemctl\b[^;&|]*\b(start|restart|try-restart|reload-or-restart|stop|enable|disable)\b[^;&|]*\.target\b",
+    # the host-side units and tools behind every guest
+    r"\b(pve-container|qemu-server)@", r"\blxc-(start|stop|destroy|freeze|unfreeze|execute|attach|create|copy|snapshot)\b",
+    r"\b(kill|killall|pkill|skill|kexec)\b",
     r"\brm\s+-\w*r\w*\s+(/|/\*|~|/root|/etc|/opt|/var|/home|/srv)(\s|$)",
     r"\bmkfs", r"\bdd\s+if=", r"\bwipefs\b", r"\bsgdisk\b", r"\bfdisk\b", r"\bparted\b",
     r"\bzfs\s+(destroy|rollback|rename|promote)\b", r"\bzpool\s+(destroy|labelclear|remove|detach|offline|split|export)\b",
@@ -70,10 +77,12 @@ DENY_READ = [
     r"\bcredentials(\.json)?\b", r"\.docker/config\.json", r"\bgetent\s+(shadow|gshadow)\b",
 ]
 
+# sqlite3 is deliberately absent: its dot-commands and writefile()/readfile() can run commands and
+# read secrets in ways an argument check can't see (e.g. `echo .shell id | sqlite3 -readonly x.db`).
 RO_CMDS = {"journalctl", "df", "free", "uptime", "cat", "tail", "head", "grep", "egrep", "ls", "find",
            "stat", "ps", "du", "dmesg", "ss", "ip", "hostname", "date", "wc", "sort", "uniq", "awk", "cut",
            "tr", "uname", "lsblk", "mount", "findmnt", "id", "whoami", "printenv", "pvesm",
-           "zfs", "zpool", "pveversion", "nginx", "pm2", "docker", "litestream", "sqlite3", "curl", "ping",
+           "zfs", "zpool", "pveversion", "nginx", "pm2", "docker", "litestream", "curl", "ping",
            "getent", "nslookup", "dig", "last", "lastlog", "who", "w", "ssh-keygen",
            "sha256sum", "openssl", "tailscale", "top", "lsof", "netstat", "which", "file",
            "sensors", "smartctl", "iostat", "vmstat", "arp", "timedatectl", "systemd-analyze", "echo", "true"}
@@ -82,7 +91,8 @@ RO_SUB = {
     "pct": {"status", "config", "list", "exec", "df"},
     "qm": {"status", "config", "list"},
     "zfs": {"list", "get"}, "zpool": {"status", "list", "iostat"},
-    "pvesm": {"status", "list"}, "pm2": {"list", "ls", "jlist", "describe", "logs", "show", "status"},
+    # pm2 jlist/describe/show/env print each app's full environment (API keys), like docker inspect
+    "pvesm": {"status", "list"}, "pm2": {"list", "ls", "logs", "status"},
     "docker": {"ps", "logs", "stats", "images"},   # no `inspect`: it prints containers' env (secrets)
     "nginx": {"-t", "-T"},
     "tailscale": {"status", "ip", "ping", "netcheck"}, "litestream": {"generations", "snapshots", "wal", "databases"},
@@ -94,18 +104,27 @@ RO_SUB = {
 # Flags that turn a "read" command into a writer or an executor.
 BAD_FLAGS = {
     "find": {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"},
-    "sort": {"-o", "--output"},
+    "sort": {"-o", "--output", "--compress-program"},
+    "ip": {"-b", "-batch", "-force", "-B"},                       # batch mode reads commands from stdin
+    "awk": {"-i", "--include", "-l", "--load", "-E", "--exec", "-f", "--file"},   # gawk inplace edit / extensions / program files
+    "date": {"-f", "--file", "-s", "--set"},                      # -f echoes each line of a file in its errors
+    "sha256sum": {"-c", "--check"},
+    "dig": {"-f", "-k"},
+    "ping": {"-f"},
     "journalctl": {"--vacuum-size", "--vacuum-time", "--vacuum-files", "--rotate", "--flush", "--sync",
                    "--relinquish-var", "--smart-relinquish-var", "--setup-keys", "--update-catalog"},
     "dmesg": {"-C", "-c", "-D", "-E", "-n", "--clear", "--read-clear", "--console-off", "--console-on", "--console-level"},
     "ss": {"-K", "--kill"},
     "sensors": {"-s", "--set"},
-    "smartctl": {"-t", "--test", "-s", "--smart", "-o", "--offlineauto", "-S", "--saveauto", "-X", "--abort"},
+    "smartctl": {"-t", "--test", "-s", "--smart", "--set", "-o", "--offlineauto", "-S", "--saveauto", "-X", "--abort"},
     "arp": {"-d", "--delete", "-s", "--set", "-f", "--file"},
     "file": {"-C", "--compile"},
     "openssl": {"-out", "-keyout"},
-    "sqlite3": {"-cmd", "-init", "-interactive"},
 }
+# Recursive grep would read every .env and key under a directory, so it's only allowed in
+# directories that hold logs and service definitions.
+GREP_RECURSE_OK = ("/var/log", "/etc/cron.d", "/etc/systemd/system", "/run/systemd", "/etc/nginx/sites-enabled",
+                   "/etc/nginx/conf.d")
 CURL_FLAGS = {"-s", "-S", "-f", "-k", "-L", "-I", "-i", "-v", "--silent", "--show-error", "--fail", "--insecure",
               "--location", "--head", "--include", "--verbose", "-4", "-6"}
 CURL_VALUE_FLAGS = {"-m", "--max-time", "--connect-timeout", "-w", "--write-out", "-H", "--header", "-o", "--output",
@@ -125,6 +144,9 @@ def _lines(name):
 
 RO_CMDS |= set(_lines("gate-ro-extra"))
 DENY_READ += _lines("gate-deny-read")
+# Exact command strings your own monitoring sends (not the AI), trusted verbatim in ro mode even if
+# they use globs or awk programs the generic checks refuse. Hard-deny and secret paths still apply.
+RO_EXACT = set(_lines("gate-ro-exact"))
 
 
 def log(decision, why=""):
@@ -139,6 +161,43 @@ def deny(why):
     log("DENY", why)
     sys.stderr.write("healer-gate: DENIED (%s)\n" % why)
     sys.exit(126)
+
+
+def shell_expansion(cmd):
+    """Why bash would expand this before running it (globs, braces, ~, $, backslashes), or ''.
+    Expansion would let a secret path or a different command hide from the checks below, so in
+    read-only mode only literal text is allowed outside single quotes."""
+    outside, quote = [], None
+    for ch in cmd:
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            continue
+        if quote == '"':
+            if ch == '"':
+                quote = None
+            elif ch in "$`\\":
+                return "shell expansion inside double quotes"
+            continue
+        if ch in "'\"":
+            quote = ch
+            continue
+        outside.append(ch)
+    text = "".join(outside)
+    if re.search(r"[*?\[\]~$\\`]", text):
+        return "shell expansion (glob, ~, $ or backslash) in ro mode"
+    if re.search(r"\{[^}]*(,|\.\.)", text):
+        return "brace expansion in ro mode"
+    return ""
+
+
+def normalize_paths(text):
+    t = re.sub(r"/{2,}", "/", text)
+    t = re.sub(r"/(\./)+", "/", t)
+    prev = None
+    while prev != t:
+        prev, t = t, re.sub(r"/(?!\.\./)[^/\s]+/\.\./", "/", t)
+    return t
 
 
 def args_ok(c, t):
@@ -157,6 +216,8 @@ def args_ok(c, t):
                     return False, "curl %s needs a value" % x
                 if x in ("-o", "--output") and a[i + 1] != "/dev/null":
                     return False, "curl write"
+                if a[i + 1].startswith("@"):            # -H @file / -w @file send a file's contents anywhere
+                    return False, "curl %s @file reads a file" % x
                 i += 2; continue
             if x.startswith("-"):
                 if x not in CURL_FLAGS and not re.fullmatch(r"-[sSfkLIiv46]+", x):
@@ -165,13 +226,21 @@ def args_ok(c, t):
                 return False, "curl: only http(s) URLs"
             i += 1
         return True, ""
-    if c == "sqlite3":
-        if "-readonly" not in a:
-            return False, "sqlite3 needs -readonly"
-        if any(re.match(r"\s*\.", x) or re.search(r"load_extension|\.shell|\.system", x, re.I) for x in a):
-            return False, "sqlite3 dot-commands are not allowed"
-    if c == "awk" and any(re.search(r"\bsystem\s*\(|getline|\||>", x) for x in a):
-        return False, "awk program runs commands or writes"
+    if c == "awk" and any(re.search(r"\bsystem\s*\(|getline|\||>|@", x) for x in a):
+        return False, "awk program runs commands, writes or loads code"
+    if c in ("grep", "egrep") and any(re.match(r"^-[^-]*[rR]", x) or x in ("--recursive", "--dereference-recursive")
+                                      or x.startswith("--directories=recurse") for x in a):
+        paths = [posixpath.normpath(x) for x in a if x.startswith("/")]
+        if not paths or not all(any(p == ok or p.startswith(ok + "/") for ok in GREP_RECURSE_OK) for p in paths):
+            return False, "recursive grep only under %s" % ", ".join(GREP_RECURSE_OK)
+    if c == "ps":
+        # BSD-style "e" (ps auxe, ps eww) prints every process's environment. Values of -o/-p/etc. are
+        # format lists or ids, not options, so skip those.
+        for prev, x in zip([""] + a, a):
+            if prev in ("-o", "-O", "--format", "-p", "--pid", "-u", "-U", "-C", "-G", "-g", "-t", "--sort") or re.fullmatch(r"[a-zA-Z]*[oO]", prev):
+                continue
+            if re.fullmatch(r"[a-zA-Z]+", x) and "e" in x:
+                return False, "ps e prints process environments (secrets)"
     if c == "uniq" and len([x for x in a if not x.startswith("-")]) > 1:
         return False, "uniq with an output file"
     if c in ("hostname", "mount") and any(not x.startswith("-") or x in ("-F", "--file", "-b", "--boot", "-a", "--all", "-o")
@@ -196,7 +265,12 @@ def ro_ok(cmd, depth=0):
         return False, "nesting too deep"
     if re.search(r"[\n\r]", cmd):
         return False, "newline in command"
+    if re.search(r"[\x00-\x08\x0b-\x1f\x7f]", cmd):
+        return False, "control character in command"
     plain = re.sub(r"\d?>\s*/dev/null|2>&1", "", cmd)
+    why = shell_expansion(plain)
+    if why:
+        return False, why
     if re.search(r"(`|\$\(|;|&&|\|\||(?<![0-9])>|>>|\btee\b|\bsed\s+-i\b)", plain):
         return False, "write/chain metacharacter in ro mode"
     try:
@@ -221,7 +295,11 @@ def ro_ok(cmd, depth=0):
             t = t[1:] if t[0] != "timeout" else t[2:]
             if not t:
                 return False, "empty after wrapper"
-        c = t[0].split("/")[-1]
+        if "/" in t[0]:
+            # /some/dir/cat would pass a basename check, and a guest can plant a binary called "cat"
+            # where the host can see it. Commands are found on PATH only.
+            return False, "give the command name, not a path (%s)" % t[0][:40]
+        c = t[0]
         if c in ("sh", "bash") and len(t) >= 3 and t[1] == "-c":
             ok, why = ro_ok(t[2], depth + 1)
             if not ok:
@@ -245,10 +323,18 @@ def ro_ok(cmd, depth=0):
                 continue
             return False, "asterisk: only -rx '<pjsip|core|ari|http|module> show ...'"
         if c in RO_SUB:
-            if len(t) < 2 or t[1] not in RO_SUB[c]:
-                if c == "systemctl" and len(t) >= 2 and t[1].startswith("--"):
+            if c == "nginx":
+                if len(t) != 2 or t[1] not in RO_SUB[c]:
+                    return False, "nginx: only -t or -T"
+                continue
+            # The verb is the first word that isn't a flag: "systemctl --no-pager restart x" is a restart.
+            words = [x for x in t[1:] if not x.startswith("-")]
+            if not words:
+                if c == "systemctl" and "--failed" in t:
                     continue
-                return False, "%s %s not read-only" % (c, t[1] if len(t) > 1 else "")
+                return False, "%s needs a read-only subcommand" % c
+            if words[0] not in RO_SUB[c]:
+                return False, "%s %s not read-only" % (c, words[0])
             ok, why = args_ok(c, t)
             if not ok:
                 return ok, why
@@ -270,10 +356,13 @@ def main():
         if re.search(rx, CMD, re.I):
             deny("hard-deny /%s/" % rx[:40])
     if MODE == "ro":
-        for rx in DENY_READ:
-            if re.search(rx, CMD, re.I):
-                deny("secret path /%s/" % rx[:40])
-        ok, why = ro_ok(CMD)
+        # Check the paths as the shell will see them: quotes removed and //, /./ and /x/../ collapsed,
+        # so "/etc//shadow", "/etc/./shadow" and /etc/sh''adow can't slip past.
+        for text in (CMD, normalize_paths(CMD), normalize_paths(CMD.replace('"', "").replace("'", ""))):
+            for rx in DENY_READ:
+                if re.search(rx, text, re.I):
+                    deny("secret path /%s/" % rx[:40])
+        ok, why = (True, "") if CMD in RO_EXACT else ro_ok(CMD)
         if not ok:
             deny(why)
     else:

