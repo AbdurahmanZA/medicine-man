@@ -1,5 +1,7 @@
 # Medicine Man
 
+[![tests](https://github.com/AbdurahmanZA/medicine-man/actions/workflows/test.yml/badge.svg)](https://github.com/AbdurahmanZA/medicine-man/actions/workflows/test.yml) [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
+
 **Let an AI take the 3am call on your Proxmox servers, without ever giving it root.**
 
 Most outages end with one command: restart the thing. Medicine Man lets

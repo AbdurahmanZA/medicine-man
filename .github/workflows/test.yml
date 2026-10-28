@@ -1,0 +1,26 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Debian 12 / 13 (Proxmox VE 8 / 9) ship 3.11 / 3.13
+        python: ['3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Compile everything
+        run: python -m py_compile gate/healer-gate.py healer/healer.py healer/playbooks.py
+      - name: Gate attack tests
+        run: python gate/test_gate.py
