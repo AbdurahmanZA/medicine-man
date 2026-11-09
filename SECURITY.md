@@ -46,7 +46,7 @@ actually run:
   extensions or program files), `curl` (GET to http(s) only, output to `/dev/null` only, no
   `@file` values), `ip` (show only, no batch mode), `sort` (no `-o`, no compress program),
   `hostname`/`date`/`mount` (show only, no `date -f`), `journalctl` (no vacuum/rotate), `openssl`
-  (x509/s_client/verify), `ssh-keygen` (fingerprints only), `grep -r` (only under log and
+  (x509/verify), `ssh-keygen` (fingerprints only), `grep -r` (only under log and
   service-definition directories). `sqlite3` is not available at all: its dot-commands and
   `writefile()` can run commands or write files in ways an argument check can't see.
 - **Secret paths can't be read:** `/etc/shadow`, `/etc/pve/priv`, private keys, `.env`
