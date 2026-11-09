@@ -75,6 +75,8 @@ DENY_READ = [
     r"\.(key|p12|pfx|kdbx)\b", r"priv(ate)?[-_]?key", r"[-_.]key\.pem\b",
     r"/proc/(\d+|self|thread-self)/environ", r"\.(git-credentials|netrc|pgpass|my\.cnf)\b",
     r"\bcredentials(\.json)?\b", r"\.docker/config\.json", r"\bgetent\s+(shadow|gshadow)\b",
+    r"/var/lib/pve-cluster\b", r"/dev/(sd|hd|vd|xvd|nvme|dm-|mapper|zd|zvol|loop|mem\b|kmem\b|port\b)",
+    r"/proc/(\d+|self|thread-self)/(mem\b|map_files\b|fd/)",
 ]
 
 # sqlite3 is deliberately absent: its dot-commands and writefile()/readfile() can run commands and
@@ -98,14 +100,14 @@ RO_SUB = {
     "tailscale": {"status", "ip", "ping", "netcheck"}, "litestream": {"generations", "snapshots", "wal", "databases"},
     "timedatectl": {"status", "show", "timesync-status", "show-timesync", "list-timezones"},
     "systemd-analyze": {"time", "blame", "critical-chain", "security", "verify", "calendar", "timespan", "timestamp"},
-    "openssl": {"x509", "s_client", "version", "verify"},
+    "openssl": {"x509", "version", "verify"},
 }
 
 # Flags that turn a "read" command into a writer or an executor.
 BAD_FLAGS = {
     "find": {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"},
     "sort": {"-o", "--output", "--compress-program"},
-    "ip": {"-b", "-batch", "-force", "-B"},                       # batch mode reads commands from stdin
+    "ip": {"-b", "-ba", "-bat", "-batc", "-batch", "-fo", "-for", "-forc", "-force", "-B"},                       # batch mode reads commands from stdin
     "awk": {"-i", "--include", "-l", "--load", "-E", "--exec", "-f", "--file"},   # gawk inplace edit / extensions / program files
     "date": {"-f", "--file", "-s", "--set"},                      # -f echoes each line of a file in its errors
     "sha256sum": {"-c", "--check"},
@@ -114,13 +116,18 @@ BAD_FLAGS = {
     "journalctl": {"--vacuum-size", "--vacuum-time", "--vacuum-files", "--rotate", "--flush", "--sync",
                    "--relinquish-var", "--smart-relinquish-var", "--setup-keys", "--update-catalog"},
     "dmesg": {"-C", "-c", "-D", "-E", "-n", "--clear", "--read-clear", "--console-off", "--console-on", "--console-level"},
-    "ss": {"-K", "--kill"},
+    "ss": {"-K", "--kill", "-D", "--diag"},
     "sensors": {"-s", "--set"},
     "smartctl": {"-t", "--test", "-s", "--smart", "--set", "-o", "--offlineauto", "-S", "--saveauto", "-X", "--abort"},
     "arp": {"-d", "--delete", "-s", "--set", "-f", "--file"},
     "file": {"-C", "--compile"},
-    "openssl": {"-out", "-keyout"},
+    "openssl": {"-out", "-keyout", "-writerand", "-sess_out"},
 }
+SINGLE_DASH_WORDS = {"find", "openssl", "ip"}                 # these take -word options: compare whole words
+# Short flags whose value may be glued on: `sort -t,` or `date -Is` end the cluster there.
+SHORT_VALUE = {"sort": "kStT", "date": "dIr", "awk": "Fv", "dig": "bcpqtxy", "ping": "cisWwlpQSIt", "dmesg": "lfFS",
+               "arp": "iAHt", "file": "eFfmP", "ss": "AfFN", "sensors": "c", "smartctl": "dlvnTbrFPqgfB"}
+VERB_BOOL_FLAGS = {"--no-pager", "--plain", "--no-legend", "--full", "--failed", "--all", "--quiet", "-a", "-l", "-q"}
 # Recursive grep would read every .env and key under a directory, so it's only allowed in
 # directories that hold logs and service definitions.
 GREP_RECURSE_OK = ("/var/log", "/etc/cron.d", "/etc/systemd/system", "/run/systemd", "/etc/nginx/sites-enabled",
@@ -200,12 +207,42 @@ def normalize_paths(text):
     return t
 
 
+def flag_hit(c, x, bad):
+    """True if x asks for a forbidden flag, however it is spelled: --outp, -o/file, -tK."""
+    name = x.split("=", 1)[0]
+    if name in bad:
+        return True
+    if c in SINGLE_DASH_WORDS:
+        return False
+    if name.startswith("--") and len(name) > 2:
+        return any(b.startswith(name) for b in bad if b.startswith("--"))    # GNU abbreviations
+    if x.startswith("-") and not x.startswith("--") and len(x) > 2:
+        short = {b[1] for b in bad if len(b) == 2}
+        for ch in x[1:]:                                                     # glued short flags
+            if ch in short:
+                return True
+            if ch in SHORT_VALUE.get(c, ""):
+                break                                                        # the rest is this flag's value
+    return False
+
+
+def verb_of(c, t):
+    """(verb, why-not). A flag before the verb may eat the next word as its value, so only flags
+    known to take no value, or with the value attached by =, may come first."""
+    for x in t[1:]:
+        if not x.startswith("-"):
+            return x, ""
+        if "=" not in x and x not in VERB_BOOL_FLAGS:
+            return None, "%s: flag %s before the subcommand" % (c, x)
+    return None, ""
+
+
 def args_ok(c, t):
     """Per-command argument checks for read commands that can also write or execute."""
     a = t[1:]
     bad = BAD_FLAGS.get(c, set())
     for x in a:
-        if x.split("=", 1)[0] in bad:
+        if flag_hit(c, x, bad):
             return False, "%s %s writes or executes" % (c, x)
     if c == "curl":
         i = 0
@@ -226,7 +263,7 @@ def args_ok(c, t):
                 return False, "curl: only http(s) URLs"
             i += 1
         return True, ""
-    if c == "awk" and any(re.search(r"\bsystem\s*\(|getline|\||>|@", x) for x in a):
+    if c == "awk" and any(re.search(r"\bsystem\s*\(|getline|\||>|@|ARGV|ARGC|ENVIRON|PROCINFO", x) for x in a):
         return False, "awk program runs commands, writes or loads code"
     if c in ("grep", "egrep") and any(re.match(r"^-[^-]*[rR]", x) or x in ("--recursive", "--dereference-recursive")
                                       or x.startswith("--directories=recurse") for x in a):
@@ -267,11 +304,11 @@ def ro_ok(cmd, depth=0):
         return False, "newline in command"
     if re.search(r"[\x00-\x08\x0b-\x1f\x7f]", cmd):
         return False, "control character in command"
-    plain = re.sub(r"\d?>\s*/dev/null|2>&1", "", cmd)
+    plain = re.sub(r"(\d?>\s*/dev/null|2>&1)(?=\s|\||$)", "", cmd)
     why = shell_expansion(plain)
     if why:
         return False, why
-    if re.search(r"(`|\$\(|;|&&|\|\||(?<![0-9])>|>>|\btee\b|\bsed\s+-i\b)", plain):
+    if re.search(r"(`|\$\(|;|&&|\|\||>|\btee\b|\bsed\s+-i\b)", plain):
         return False, "write/chain metacharacter in ro mode"
     try:
         lx = shlex.shlex(plain, posix=True, punctuation_chars=True)
@@ -279,7 +316,7 @@ def ro_ok(cmd, depth=0):
         toks = list(lx)
     except ValueError:
         return False, "unparseable"
-    if any(x in ("&", "<", "<<", "(", ")") for x in toks):
+    if any(x and x != "|" and set(x) <= set("();<>|&") for x in toks):      # |& pipes without a | token
         return False, "shell operator in ro mode"
     segs, cur = [], []
     for x in toks:                      # split on unquoted pipes only
@@ -328,13 +365,15 @@ def ro_ok(cmd, depth=0):
                     return False, "nginx: only -t or -T"
                 continue
             # The verb is the first word that isn't a flag: "systemctl --no-pager restart x" is a restart.
-            words = [x for x in t[1:] if not x.startswith("-")]
-            if not words:
+            verb, why = verb_of(c, t)
+            if why:
+                return False, why
+            if verb is None:
                 if c == "systemctl" and "--failed" in t:
                     continue
                 return False, "%s needs a read-only subcommand" % c
-            if words[0] not in RO_SUB[c]:
-                return False, "%s %s not read-only" % (c, words[0])
+            if verb not in RO_SUB[c]:
+                return False, "%s %s not read-only" % (c, verb)
             ok, why = args_ok(c, t)
             if not ok:
                 return ok, why
